@@ -1,0 +1,13 @@
+# EKS ships only the old gp2 class. This one asks the EBS CSI driver for gp3 volumes.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+# Wait until a pod is scheduled so the EBS volume is created in that pod's availability zone.
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+allowVolumeExpansion: true

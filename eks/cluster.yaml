@@ -1,0 +1,37 @@
+# eksctl turns this file into real AWS resources (via CloudFormation):
+# a VPC with public+private subnets, the EKS control plane, IAM roles, and a node group.
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: todo-eks
+  region: us-east-1
+  version: "1.36"
+
+vpc:
+  nat:
+    gateway: Single   # one NAT gateway (~$32/mo) lets private nodes pull images; HighlyAvailable would be 3x
+
+addons:
+  # Core cluster networking/DNS, installed and kept up to date by EKS.
+  - name: vpc-cni
+  - name: coredns
+  - name: kube-proxy
+  # Lets pods assume IAM roles (used by the EBS driver now, the ALB controller later).
+  - name: eks-pod-identity-agent
+  # Creates EBS volumes on demand for PersistentVolumeClaims (our Postgres disk).
+  - name: aws-ebs-csi-driver
+    # eksctl creates the IAM role (AmazonEBSCSIDriverPolicy) and links it to the driver's service account.
+    useDefaultPodIdentityAssociations: true
+
+managedNodeGroups:
+  - name: workers
+    instanceType: t3.medium
+    amiFamily: AmazonLinux2023
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 3
+    volumeSize: 20
+    privateNetworking: true     # nodes live in private subnets; only the ALB is public
+    nodeRepairConfig:
+      enabled: true             # EKS replaces nodes that stay unhealthy

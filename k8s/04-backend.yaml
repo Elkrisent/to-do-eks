@@ -1,0 +1,56 @@
+# ${ECR_REGISTRY} and ${IMAGE_TAG} are filled in by `envsubst` before applying.
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend            # keep this name: the frontend's nginx.conf resolves "backend"
+  namespace: todo
+  annotations:
+    # The ALB health-checks this target group on /api/healthz (the ingress default is "/").
+    alb.ingress.kubernetes.io/healthcheck-path: /api/healthz
+spec:
+  selector:
+    app: backend
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: todo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: backend
+          image: ${ECR_REGISTRY}/todo-backend:${IMAGE_TAG}
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: todo-db, key: DATABASE_URL } }
+          readinessProbe:
+            httpGet: { path: /api/healthz, port: 8000 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /api/healthz, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }

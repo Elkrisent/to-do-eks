@@ -64,6 +64,26 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  manifests:
+    # Catch typos and invalid fields in k8s/*.yaml before they reach a cluster.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fill in image placeholders with dummy values
+        run: |
+          mkdir rendered
+          export ECR_REGISTRY=123456789012.dkr.ecr.us-east-1.amazonaws.com IMAGE_TAG=ci
+          # shellcheck disable=SC2016  # envsubst needs the literal ${...} variable list
+          VARS='${ECR_REGISTRY} ${IMAGE_TAG}'
+          for f in k8s/0*.yaml; do
+            out="rendered/$(basename "$f")"
+            envsubst "$VARS" < "$f" > "$out"
+          done
+      - name: Validate against the Kubernetes schema
+        run: |
+          docker run --rm -v "$PWD/rendered:/m:ro" ghcr.io/yannh/kubeconform:latest \
+            -strict -summary -kubernetes-version 1.36.0 /m
+
   images:
     # Build both images exactly as production would, then scan them for known CVEs.
     # Nothing is pushed here; pushing happens only in deploy.yml.

@@ -1,0 +1,26 @@
+# The AWS Load Balancer Controller sees this and builds one internet-facing ALB:
+#   /api/*  -> backend Service     everything else -> frontend Service
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: todo
+  namespace: todo
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    # Send traffic straight to pod IPs (needs the VPC CNI, which EKS uses by default).
+    alb.ingress.kubernetes.io/target-type: ip
+    # Default health check; the backend Service overrides it with /api/healthz.
+    alb.ingress.kubernetes.io/healthcheck-path: /
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service: { name: backend, port: { number: 8000 } }
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: frontend, port: { number: 8080 } }

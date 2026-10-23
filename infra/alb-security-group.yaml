@@ -1,0 +1,36 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Security group for the todo ALB that only accepts HTTP from CloudFront's origin-facing
+  IP ranges, so the load balancer cannot be reached directly from the internet.
+  Create this BEFORE the Ingress uses it (see README stage 6).
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The EKS cluster's VPC
+  CloudFrontPrefixListId:
+    Type: String
+    Description: Managed prefix list com.amazonaws.global.cloudfront.origin-facing (differs per region)
+    AllowedPattern: "pl-[0-9a-f]+"
+
+Resources:
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: todo ALB - HTTP from CloudFront only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # This one rule expands to ~55 CIDR entries and counts that many against the
+        # per-group rule quota (default 60). Don't add many more rules to this group.
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+          Description: HTTP from CloudFront
+      Tags:
+        - { Key: Name, Value: todo-alb-cloudfront-only }
+
+Outputs:
+  SecurityGroupId:
+    Description: Put this in the Ingress annotation alb.ingress.kubernetes.io/security-groups
+    Value: !Ref AlbSecurityGroup

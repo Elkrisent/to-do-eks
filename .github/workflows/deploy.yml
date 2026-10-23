@@ -1,0 +1,110 @@
+name: Deploy
+
+# Runs when something lands on main (e.g. you merge a PR), or by hand from the Actions tab.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One deploy at a time. A second push waits for the first instead of racing it
+# (and we never cancel a deploy halfway, which could leave the cluster half-updated).
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: todo-eks
+
+jobs:
+  ci:
+    # The exact same checks as pull requests; deploy only runs if they pass.
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: ci
+    # Skipped (not failed) until AWS is set up and the AWS_ROLE_ARN repo variable exists (README stage 7).
+    if: ${{ vars.AWS_ROLE_ARN != '' }}
+    runs-on: ubuntu-latest
+    # Attaches this job to the "production" GitHub Environment: the AWS role only trusts
+    # tokens from this environment, and you can add required reviewers to it in repo settings.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write   # lets the job request GitHub's OIDC token to exchange for AWS credentials
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get temporary AWS credentials (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push images (tag = short commit SHA)
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE_TAG="${GITHUB_SHA::7}"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          for c in backend frontend; do
+            repo="todo-$c"
+            # ECR tags are immutable, so re-running a deploy for the same commit must not push again.
+            if aws ecr describe-images --repository-name "$repo" --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+              echo "$repo:$IMAGE_TAG already in ECR, skipping push"
+            else
+              docker build -t "$ECR_REGISTRY/$repo:$IMAGE_TAG" "$c"
+              docker push "$ECR_REGISTRY/$repo:$IMAGE_TAG"
+            fi
+          done
+
+      - name: Point kubectl at the cluster
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Apply manifests
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          ALB_SG_ID=$(aws cloudformation describe-stacks --stack-name todo-alb-sg \
+            --query "Stacks[0].Outputs[?OutputKey=='SecurityGroupId'].OutputValue" --output text)
+          export ALB_SG_ID
+          # shellcheck disable=SC2016  # envsubst needs the literal ${...} variable list
+          VARS='${ECR_REGISTRY} ${IMAGE_TAG} ${ALB_SG_ID}'
+          for f in k8s/0*.yaml; do
+            envsubst "$VARS" < "$f" | kubectl apply -f -
+          done
+
+      - name: Wait for the rollout
+        run: |
+          kubectl -n todo rollout status statefulset/postgres --timeout=300s
+          kubectl -n todo rollout status deployment/backend --timeout=300s
+          kubectl -n todo rollout status deployment/frontend --timeout=300s
+
+      - name: Smoke test through CloudFront
+        run: |
+          URL=$(aws cloudformation describe-stacks --stack-name todo-cloudfront \
+            --query "Stacks[0].Outputs[?OutputKey=='AppUrl'].OutputValue" --output text)
+          echo "Testing $URL"
+          for i in $(seq 1 12); do
+            if curl -fsS "$URL/api/healthz" && curl -fsS "$URL/api/todos" >/dev/null && curl -fsS "$URL/" >/dev/null; then
+              echo "Smoke test passed"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in 10s"
+            sleep 10
+          done
+          echo "Smoke test failed" >&2
+          exit 1
+
+      - name: Show cluster state on failure
+        if: failure()
+        run: |
+          kubectl -n todo get pods,svc,ingress -o wide || true
+          kubectl -n todo describe pods | tail -60 || true

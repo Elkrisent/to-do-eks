@@ -72,9 +72,9 @@ jobs:
       - name: Fill in image placeholders with dummy values
         run: |
           mkdir rendered
-          export ECR_REGISTRY=123456789012.dkr.ecr.us-east-1.amazonaws.com IMAGE_TAG=ci
+          export ECR_REGISTRY=123456789012.dkr.ecr.us-east-1.amazonaws.com IMAGE_TAG=ci ALB_SG_ID=sg-0123456789abcdef0
           # shellcheck disable=SC2016  # envsubst needs the literal ${...} variable list
-          VARS='${ECR_REGISTRY} ${IMAGE_TAG}'
+          VARS='${ECR_REGISTRY} ${IMAGE_TAG} ${ALB_SG_ID}'
           for f in k8s/0*.yaml; do
             out="rendered/$(basename "$f")"
             envsubst "$VARS" < "$f" > "$out"
@@ -83,6 +83,17 @@ jobs:
         run: |
           docker run --rm -v "$PWD/rendered:/m:ro" ghcr.io/yannh/kubeconform:latest \
             -strict -summary -kubernetes-version 1.36.0 /m
+
+  infra:
+    # Lint the CloudFormation templates (catches bad properties and risky patterns).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cfn-lint
+      - run: cfn-lint infra/*.yaml
 
   images:
     # Build both images exactly as production would, then scan them for known CVEs.

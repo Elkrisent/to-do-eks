@@ -137,6 +137,24 @@ The IAM steps are one-time setup that **creates permissions**, so they are delib
 
 ## Stage 5: first deploy, by hand
 
+**Lock the door before opening it.** The ALB should only ever accept traffic from CloudFront, so first create its
+security group (infra/alb-security-group.yaml). The Ingress refers to it, so it must exist before the first apply.
+A *security group* is AWS's firewall for network interfaces; this one allows port 80 only from CloudFront's published IP ranges.
+
+```bash
+PL_ID=$(aws ec2 describe-managed-prefix-lists --region $AWS_REGION \
+  --filters Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing \
+  --query 'PrefixLists[0].PrefixListId' --output text)
+aws cloudformation deploy --stack-name todo-alb-sg --template-file infra/alb-security-group.yaml \
+  --parameter-overrides VpcId=$VPC_ID CloudFrontPrefixListId=$PL_ID
+export ALB_SG_ID=$(aws cloudformation describe-stacks --stack-name todo-alb-sg \
+  --query "Stacks[0].Outputs[?OutputKey=='SecurityGroupId'].OutputValue" --output text)
+echo $ALB_SG_ID     # sg-...
+```
+(`$VPC_ID` was set in Stage 4. If you opened a new terminal, re-run the `export`/`VPC_ID=` lines from Stages 2 and 4.)
+
+Now build, push and deploy:
+
 ```bash
 # Build and push both images. Tags are immutable, so use a fresh tag each time.
 export IMAGE_TAG=$(git rev-parse --short HEAD)
@@ -153,34 +171,94 @@ kubectl -n todo create secret generic todo-db \
   --from-literal=POSTGRES_USER=todo --from-literal=POSTGRES_PASSWORD="$PGPASS" --from-literal=POSTGRES_DB=todo \
   --from-literal=DATABASE_URL="postgresql+psycopg://todo:${PGPASS}@postgres:5432/todo"
 
-# Apply everything. envsubst fills ${ECR_REGISTRY} and ${IMAGE_TAG} into the manifests.
-for f in k8s/0*.yaml; do envsubst '${ECR_REGISTRY} ${IMAGE_TAG}' < "$f" | kubectl apply -f -; done
+# Apply everything. envsubst fills the ${...} placeholders into the manifests.
+for f in k8s/0*.yaml; do envsubst '${ECR_REGISTRY} ${IMAGE_TAG} ${ALB_SG_ID}' < "$f" | kubectl apply -f -; done
 
 kubectl -n todo get pods -w            # wait for all Running/Ready (Postgres first, then backend)
 kubectl -n todo get ingress todo       # ADDRESS appears after 2-3 min: the ALB's DNS name
-curl http://<ADDRESS>/api/healthz      # expect {"status":"ok"}; open http://<ADDRESS>/ in a browser
+```
+The ALB can't be reached directly (that is the point), so check the app from inside the cluster instead:
+
+```bash
+kubectl -n todo port-forward svc/backend 8000:8000 &     # tunnel your localhost:8000 to the backend Service
+curl localhost:8000/api/healthz                          # expect {"status":"ok"}  (this also proves Postgres works)
+kill %1
 ```
 If the ALB isn't created, check the controller: `kubectl -n kube-system logs deploy/aws-load-balancer-controller`.
 
-At this point the app is live on the internet over plain HTTP. HTTPS comes in the CloudFront stage.
+## Stage 6: HTTPS with CloudFront
+
+The ALB speaks plain HTTP. **CloudFront** is AWS's CDN: it sits in front, gives viewers HTTPS with a certificate AWS manages for
+`*.cloudfront.net` (no domain needed), and forwards requests to the ALB over HTTP. Caching is turned off, so it acts as a TLS front door.
+
+```bash
+ALB_DNS=$(kubectl -n todo get ingress todo -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+aws cloudformation deploy --stack-name todo-cloudfront --template-file infra/cloudfront.yaml \
+  --parameter-overrides AlbDnsName=$ALB_DNS            # 5-10 minutes: CloudFront has to roll out to its edge locations
+aws cloudformation describe-stacks --stack-name todo-cloudfront \
+  --query "Stacks[0].Outputs[?OutputKey=='AppUrl'].OutputValue" --output text
+```
+Open that `https://dxxxx.cloudfront.net` URL: you have the app on HTTPS. Two checks worth running:
+
+```bash
+curl -i http://<CLOUDFRONT-DOMAIN>/                 # 301 redirect to https
+curl -m 8 http://$ALB_DNS/ || echo "blocked, as intended"   # hits the ALB directly: times out
+```
+
+## Stage 7: automatic deploys (GitHub Actions + OIDC)
+
+`deploy.yml` builds, pushes and deploys on every push to `main`. It authenticates to AWS using **OIDC**: GitHub gives each run a
+short-lived signed token, and an IAM role trusts only tokens from this repo's `production` environment. No AWS keys are stored anywhere.
+
+**MANUAL, because they create permissions** (one-time):
+
+```bash
+# 1. The IAM role GitHub will assume (and the OIDC provider that makes GitHub trusted).
+#    If you already have a GitHub OIDC provider in this account, add: CreateOidcProvider=false
+aws cloudformation deploy --stack-name todo-github-oidc --template-file infra/github-oidc.yaml \
+  --capabilities CAPABILITY_NAMED_IAM
+ROLE_ARN=$(aws cloudformation describe-stacks --stack-name todo-github-oidc \
+  --query "Stacks[0].Outputs[?OutputKey=='RoleArn'].OutputValue" --output text)
+
+# 2. Let that role use kubectl inside the cluster. AWS permissions and Kubernetes permissions are separate
+#    systems: an "access entry" maps the IAM role to a Kubernetes permission set.
+#    ClusterAdmin is needed because the deploy creates a namespace and StorageClass (cluster-wide objects).
+#    In a real company you would narrow this.
+aws eks create-access-entry --cluster-name todo-eks --principal-arn $ROLE_ARN
+aws eks associate-access-policy --cluster-name todo-eks --principal-arn $ROLE_ARN \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+  --access-scope type=cluster
+
+# 3. Tell GitHub: the "production" environment, and the role to assume.
+gh api -X PUT repos/Elkrisent/to-do-eks/environments/production
+gh variable set AWS_ROLE_ARN --body "$ROLE_ARN" --repo Elkrisent/to-do-eks
+```
+Until `AWS_ROLE_ARN` is set, the deploy job is skipped (not failed). After that, merging to `main` triggers
+CI, then the deploy, then a smoke test against the CloudFront URL. In **Settings -> Environments -> production** you can add
+"Required reviewers" so each deploy waits for your approval.
 
 ## Teardown (do this when you stop, or you keep paying)
 
-Order matters: the ALB and EBS volume were created by Kubernetes controllers, **outside** the CloudFormation stack.
-If you delete the cluster first, they can be left behind (and keep billing) or block the VPC from deleting.
+Order matters: the ALB and EBS volume were created by Kubernetes controllers, **outside** the cluster's CloudFormation stack.
+If you delete the cluster first, they can be left behind (and keep billing), or block the VPC from deleting.
+The ALB security group must go *after* the ALB (it is in use until then) but *before* the cluster (it lives in the cluster's VPC).
 
 ```bash
+aws cloudformation delete-stack --stack-name todo-cloudfront && \
+  aws cloudformation wait stack-delete-complete --stack-name todo-cloudfront     # takes several minutes
 kubectl delete ingress todo -n todo            # makes the controller delete the ALB
+sleep 90                                       # give it time to finish; confirm under EC2 -> Load Balancers
 kubectl delete pvc -n todo --all               # deletes the EBS volume (reclaimPolicy: Delete)
 kubectl delete namespace todo
+aws cloudformation delete-stack --stack-name todo-alb-sg && \
+  aws cloudformation wait stack-delete-complete --stack-name todo-alb-sg
 helm uninstall aws-load-balancer-controller -n kube-system
 eksctl delete cluster -f eks/cluster.yaml --wait   # ~10-15 min
 # Optional cleanup of the rest:
+aws cloudformation delete-stack --stack-name todo-github-oidc
 aws ecr delete-repository --repository-name todo-backend --force --region $AWS_REGION
 aws ecr delete-repository --repository-name todo-frontend --force --region $AWS_REGION
 aws iam delete-policy --policy-arn arn:aws:iam::$ACCOUNT_ID:policy/AWSLoadBalancerControllerIAMPolicy
+gh variable delete AWS_ROLE_ARN --repo Elkrisent/to-do-eks    # so deploys skip instead of failing
 ```
-Afterwards, check the console (EC2 -> Load Balancers and Volumes) that nothing is left.
-
-## Coming next
-CloudFront + HTTPS lockdown, and the deploy workflow with OIDC, are added in the following stages.
+Afterwards, check the console (EC2 -> Load Balancers and Volumes, CloudFront) that nothing is left.

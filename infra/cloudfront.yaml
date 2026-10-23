@@ -1,0 +1,44 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudFront distribution that gives the todo app HTTPS (a *.cloudfront.net certificate,
+  no domain needed) in front of the ALB created by the Ingress.
+
+Parameters:
+  AlbDnsName:
+    Type: String
+    Description: DNS name of the ALB (kubectl -n todo get ingress todo)
+
+Resources:
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: todo app on EKS
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100          # US/Canada/Europe edges only; cheapest
+        Origins:
+          - Id: alb
+            DomainName: !Ref AlbDnsName
+            CustomOriginConfig:
+              # The ALB has no certificate for its amazonaws.com name, so CloudFront
+              # talks plain HTTP to it. Viewers still get HTTPS.
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+        DefaultCacheBehavior:
+          TargetOriginId: alb
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          # PUT/DELETE/POST must reach the API, so allow every method.
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          # Managed policies: no caching (API responses must never be stale),
+          # and forward everything the app needs except the Host header.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad          # Managed-CachingDisabled
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # Managed-AllViewerExceptHostHeader
+
+Outputs:
+  DistributionDomain:
+    Value: !GetAtt Distribution.DomainName
+  AppUrl:
+    Description: Open this in a browser
+    Value: !Sub https://${Distribution.DomainName}

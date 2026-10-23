@@ -11,6 +11,11 @@ metadata:
     alb.ingress.kubernetes.io/target-type: ip
     # Default health check; the backend Service overrides it with /api/healthz.
     alb.ingress.kubernetes.io/healthcheck-path: /
+    # Only CloudFront may reach the ALB (security group from infra/alb-security-group.yaml).
+    # ${ALB_SG_ID} is filled in by envsubst.
+    alb.ingress.kubernetes.io/security-groups: ${ALB_SG_ID}
+    # Lets the controller open the nodes' security group to traffic from the ALB's group.
+    alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
 spec:
   ingressClassName: alb
   rules:

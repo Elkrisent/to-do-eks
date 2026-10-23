@@ -1,0 +1,45 @@
+body {
+  font-family: system-ui, sans-serif;
+  background: #f5f6f8;
+  margin: 0;
+}
+
+main {
+  max-width: 480px;
+  margin: 3rem auto;
+  padding: 0 1rem;
+}
+
+form {
+  display: flex;
+  gap: 0.5rem;
+}
+
+form input {
+  flex: 1;
+  padding: 0.5rem;
+}
+
+ul {
+  list-style: none;
+  padding: 0;
+}
+
+li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #fff;
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+}
+
+li.done label {
+  text-decoration: line-through;
+  color: #888;
+}
+
+[role="alert"] {
+  color: #b00020;
+}
